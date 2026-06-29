@@ -65,14 +65,20 @@ see-plan-act/
 ### Train
 
 ```bash
-# Train on 8 tasks, hold out 2 for testing (skip cross-validation)
+# Standard: train on all 10 tasks
 python train_bc.py \
   --demo_dir ../../libero/datasets/libero_object \
-  --held_out_tasks 0 1 \
   --skip_folds \
   --epochs 200
 
-# Full training with 4-fold cross-validation
+# With a different seed
+python train_bc.py \
+  --demo_dir ../../libero/datasets/libero_object \
+  --skip_folds \
+  --seed 123 \
+  --epochs 200
+
+# With cross-task generalization (hold out 2 tasks for testing)
 python train_bc.py \
   --demo_dir ../../libero/datasets/libero_object \
   --held_out_tasks 0 1 \
@@ -80,7 +86,7 @@ python train_bc.py \
   --epochs 200
 ```
 
-Saves best checkpoint to `checkpoints/bc_best.pt`.
+Saves best checkpoint to `checkpoints/bc_best_seed<N>.pt`.
 
 ### Evaluate
 
@@ -115,9 +121,10 @@ Saves per-episode GIFs to `eval_gifs/` (e.g. `ep0_success.gif`, `ep1_fail.gif`).
 | Arg | Default | Description |
 |-----|---------|-------------|
 | `--demo_dir` | required | Path to demo HDF5 directory |
-| `--held_out_tasks` | 0 1 | File indices to hold out for testing |
+| `--held_out_tasks` | [] (none) | File indices to hold out for testing |
 | `--num_folds` | 4 | Number of cross-validation folds |
 | `--skip_folds` | false | Skip CV, train final model only |
+| `--seed` | 42 | Random seed for reproducibility |
 | `--chunk_size` | 8 | Number of future actions to predict |
 | `--seq_len` | 10 | Temporal window length for LSTM |
 | `--hidden_dim` | 256 | Transformer/projection hidden dimension |
