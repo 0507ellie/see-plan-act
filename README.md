@@ -1,113 +1,135 @@
 # See-Plan-Act
 
-Observation extraction and policy learning pipeline for LIBERO robotic manipulation tasks.
+Behavioral cloning pipeline for LIBERO robotic manipulation with fine-tuned visual encoders, LSTM temporal memory, transformer action decoding, and action chunking.
+
+## Architecture
+
+```
+Per step:
+  camera images ──→ ResNet18 (layer3+4 fine-tuned) ──→ 2 visual tokens (512-d)
+  camera images ──→ CLIP ViT-B/32 (frozen + LoRA) ──→ 2 visual tokens (512-d)
+  proprio (9-d) ──→ linear projection ──→ 1 token
+  language instr ──→ CLIP text (frozen + LoRA) ──→ 1 token
+
+  all 6 tokens ──→ LSTM (2-layer, 512 hidden) ──→ compressed history token
+
+  [history, vis x4, proprio, lang] ──→ transformer decoder ──→ 8-step action chunk
+```
+
+## Key features
+
+- **Action chunking** (k=8): predicts 8 future actions per step for better trajectory planning
+- **ResNet fine-tuning**: last 2 layers unfrozen with 10x lower LR to learn manipulation-relevant spatial features
+- **LSTM temporal memory**: maintains hidden state across steps so the policy remembers what it's been doing
+- **LoRA adapters**: lightweight adaptation of frozen CLIP visual/language features
+- **L1 loss**: sharper action predictions vs MSE
+- **Cosine LR with warmup**: 5-epoch warmup, cosine decay from 1e-4 to 1e-5
+- **K-fold cross-validation**: task-level folds to evaluate cross-task generalization
+- **Visual augmentation**: ColorJitter + RandomAffine on images before ResNet encoding
+- **Auxiliary done prediction**: transformer predicts task completion as a secondary objective
 
 ## Project structure
 
 ```
 see-plan-act/
+  train_bc.py     # Training pipeline (BCPolicy, DemoDataset, k-fold CV)
+  eval.py         # Evaluation with rollout GIF generation
   obs.py          # Data collection + visual encoding (random rollouts)
-  train_bc.py     # Behavior cloning training
-  eval.py         # Shared evaluation (works with any policy)
 ```
 
 ## Cameras
 
-- **agentview** — Fixed third-person camera overlooking the workspace (global scene context)
-- **eye_in_hand** — Wrist-mounted camera on the end-effector (close-up detail for grasping)
-
-Both cameras capture RGBD (RGB + depth as 4th channel).
+- **agentview** — Fixed third-person camera overlooking the workspace
+- **eye_in_hand** — Wrist-mounted camera on the end-effector
 
 ## Encoders
 
-| Encoder | Model | Embedding Dim | Applied to |
-|---------|-------|---------------|------------|
-| ResNet  | ResNet18 (ImageNet pretrained, fc removed) | 512 | RGB only |
-| CLIP    | ViT-B/32 | 512 | RGB only |
+| Encoder | Model | Dim | Status |
+|---------|-------|-----|--------|
+| ResNet  | ResNet18 (ImageNet init) | 512 | layer3+4 fine-tuned, layer1+2 frozen |
+| CLIP image | ViT-B/32 | 512 | Frozen + LoRA adapter (rank=32) |
+| CLIP text | ViT-B/32 | 512 | Frozen + LoRA adapter (rank=32) |
 
-Depth is stored raw as the 4th channel of RGBD — intended for a learned encoder in the policy, not pretrained RGB encoders.
+## Input/Output
 
-## Policies
+**Inputs:**
+- CLIP visual embeddings: agentview (512) + eye_in_hand (512) = 1024-d (pre-computed)
+- Raw images: agentview + eye_in_hand (for ResNet, processed on-the-fly)
+- Proprio (9-d): ee_pos (3) + ee_ori (3, axis-angle) + gripper_states (2) + gripper_open (1, binary)
+- Language: CLIP text embedding of task instruction (512-d)
 
-### Behavior Cloning (BC)
-
-3-layer MLP trained with MSE on expert demonstrations.
-
-**Input:** CLIP agentview (512) + CLIP eye_in_hand (512) + proprio (8) = 1032-d
-- Proprio: ee_pos (3) + ee_ori (3, axis-angle) + gripper (2)
-- Actions are normalized (zero mean, unit std)
-
-**Output:** 7-DoF action (6 arm + 1 gripper)
+**Output:** 8-step action chunk, each action is 7-DoF (6 arm + 1 gripper)
 
 ## Usage
 
-### 1. Collect observations (random rollouts)
+### Train
 
 ```bash
-/workspace/envs/libero/bin/python3.10 obs.py
-```
+# Train on 8 tasks, hold out 2 for testing (skip cross-validation)
+python train_bc.py \
+  --demo_dir ../../libero/datasets/libero_object \
+  --held_out_tasks 0 1 \
+  --skip_folds \
+  --epochs 200
 
-### 2. Train BC
-
-```bash
-/workspace/envs/libero/bin/python3.10 train_bc.py \
-  --demo_path /workspace/LIBERO/libero/datasets/libero_object/pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5 \
-  --epochs 100 \
-  --batch_size 64 \
-  --lr 1e-3
+# Full training with 4-fold cross-validation
+python train_bc.py \
+  --demo_dir ../../libero/datasets/libero_object \
+  --held_out_tasks 0 1 \
+  --num_folds 4 \
+  --epochs 200
 ```
 
 Saves best checkpoint to `checkpoints/bc_best.pt`.
 
-### 3. Evaluate
+### Evaluate
 
 ```bash
-/workspace/envs/libero/bin/python3.10 eval.py \
+python eval.py \
   --policy bc \
   --checkpoint checkpoints/bc_best.pt \
-  --task_id 0
+  --suite libero_object \
+  --task_id 0 \
+  --num_episodes 20
 ```
 
 Saves per-episode GIFs to `eval_gifs/` (e.g. `ep0_success.gif`, `ep1_fail.gif`).
 
-### Adding a new policy
+### Task ID mapping (libero_object)
 
-1. Create `train_<name>.py` with a policy class (must have `forward(visual, proprio) -> action`)
-2. Add an entry to `POLICY_REGISTRY` in `eval.py`
-3. Eval works automatically
+| Task ID | Task |
+|---------|------|
+| 0 | pick up the alphabet soup and place it in the basket |
+| 1 | pick up the cream cheese and place it in the basket |
+| 2 | pick up the salad dressing and place it in the basket |
+| 3 | pick up the bbq sauce and place it in the basket |
+| 4 | pick up the ketchup and place it in the basket |
+| 5 | pick up the tomato sauce and place it in the basket |
+| 6 | pick up the butter and place it in the basket |
+| 7 | pick up the milk and place it in the basket |
+| 8 | pick up the chocolate pudding and place it in the basket |
+| 9 | pick up the orange juice and place it in the basket |
 
-## obs.py outputs
+### Training arguments
 
-- `rollout_data.hdf5` — Full rollout data (actions, rewards, dones, proprioception, RGBD)
-- `agentview_embed.npy` / `eye_in_hand_embed.npy` — ResNet18 embeddings
-- `agentview_clip_embed.npy` / `eye_in_hand_clip_embed.npy` — CLIP embeddings
-- `rollout.gif` — Animated GIF of agentview rollout
-
-### HDF5 structure
-
-```
-data/
-  attrs: task, num_steps, resnet_encoder, resnet_embed_dim, clip_encoder, clip_embed_dim
-  actions            (N, 7)
-  rewards            (N,)
-  dones              (N,)
-  obs/
-    ee_pos           (N, 3)
-    ee_quat          (N, 4)
-    joint_pos        (N, 7)
-    joint_pos_cos    (N, 7)
-    joint_pos_sin    (N, 7)
-    joint_vel        (N, 7)
-    gripper_qpos     (N, 2)
-    gripper_qvel     (N, 2)
-    agentview_rgbd   (N, 256, 256, 4)
-    eye_in_hand_rgbd (N, 256, 256, 4)
-```
+| Arg | Default | Description |
+|-----|---------|-------------|
+| `--demo_dir` | required | Path to demo HDF5 directory |
+| `--held_out_tasks` | 0 1 | File indices to hold out for testing |
+| `--num_folds` | 4 | Number of cross-validation folds |
+| `--skip_folds` | false | Skip CV, train final model only |
+| `--chunk_size` | 8 | Number of future actions to predict |
+| `--seq_len` | 10 | Temporal window length for LSTM |
+| `--hidden_dim` | 256 | Transformer/projection hidden dimension |
+| `--batch_size` | 64 | Batch size |
+| `--lr` | 1e-4 | Base learning rate (ResNet uses lr*0.1) |
+| `--epochs` | 200 | Max training epochs |
+| `--patience` | 25 | Early stopping patience |
+| `--aux_weight` | 0.1 | Weight for auxiliary done prediction loss |
 
 ## Dependencies
 
-- libero
+- libero, robosuite
 - torch, torchvision
 - clip (OpenAI)
-- robosuite
 - h5py, numpy, Pillow
