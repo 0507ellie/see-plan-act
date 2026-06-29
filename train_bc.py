@@ -404,6 +404,11 @@ def train_one(train_dataset, val_dataset, args, save_path):
 
 
 def train(args):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    print(f"Seed: {args.seed}")
+
     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
 
     demo_dir = Path(args.demo_dir)
@@ -470,7 +475,7 @@ def train(args):
     train_split = DemoSubset(final_ds, train_indices.indices)
     val_split = DemoSubset(final_ds, val_indices.indices)
 
-    final_path = save_dir / "bc_best.pt"
+    final_path = save_dir / f"bc_best_seed{args.seed}.pt"
     best_final = train_one(train_split, val_split, args, final_path)
     print(f"Final model best val loss: {best_final:.6f}")
     print(f"Saved final checkpoint to {final_path}")
@@ -479,9 +484,10 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo_dir", type=str, required=True)
-    parser.add_argument("--held_out_tasks", type=int, nargs="+", default=[0, 1])
+    parser.add_argument("--held_out_tasks", type=int, nargs="*", default=[])
     parser.add_argument("--num_folds", type=int, default=4)
     parser.add_argument("--skip_folds", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chunk_size", type=int, default=8)
     parser.add_argument("--seq_len", type=int, default=10)
     parser.add_argument("--hidden_dim", type=int, default=256)
