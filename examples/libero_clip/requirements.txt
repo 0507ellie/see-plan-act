@@ -1,0 +1,7 @@
+torch
+transformers
+pillow
+numpy
+h5py
+imageio
+imageio-ffmpeg

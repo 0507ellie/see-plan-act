@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local model/data/output artifacts
+outputs/
+datasets/
+*.hdf5
+*.npy
+*.npz
+*.mp4
+*.pt
+*.pth
+*.safetensors
