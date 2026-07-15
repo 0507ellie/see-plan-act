@@ -6,7 +6,7 @@ Behavioral cloning pipeline for LIBERO robotic manipulation with fine-tuned visu
 
 ```
 Per step:
-  camera images ──→ ResNet18 (layer3+4 fine-tuned) ──→ 2 visual tokens (512-d)
+  camera images ──→ ResNet18 (frozen + LoRA) ──→ 2 visual tokens (512-d)
   camera images ──→ CLIP ViT-B/32 (frozen + LoRA) ──→ 2 visual tokens (512-d)
   proprio (9-d) ──→ linear projection ──→ 1 token
   language instr ──→ CLIP text (frozen + LoRA) ──→ 1 token
@@ -19,12 +19,11 @@ Per step:
 ## Key features
 
 - **Action chunking** (k=8): predicts 8 future actions per step for better trajectory planning
-- **ResNet fine-tuning**: last 2 layers unfrozen with 10x lower LR to learn manipulation-relevant spatial features
+- **LoRA adapters**: lightweight adaptation of frozen ResNet/CLIP visual and CLIP language features
 - **LSTM temporal memory**: maintains hidden state across steps so the policy remembers what it's been doing
-- **LoRA adapters**: lightweight adaptation of frozen CLIP visual/language features
 - **L1 loss**: sharper action predictions vs MSE
 - **Cosine LR with warmup**: 5-epoch warmup, cosine decay from 1e-4 to 1e-5
-- **K-fold cross-validation**: task-level folds to evaluate cross-task generalization
+- **Periodic rollout eval**: runs real closed-loop episodes every N epochs during training to track success rate, not just loss
 - **Visual augmentation**: ColorJitter + RandomAffine on images before ResNet encoding
 - **Auxiliary done prediction**: transformer predicts task completion as a secondary objective
 
@@ -32,7 +31,7 @@ Per step:
 
 ```
 see-plan-act/
-  train_bc.py     # Training pipeline (BCPolicy, DemoDataset, k-fold CV)
+  train_bc.py     # Training pipeline (BCPolicy, DemoDataset, rollout eval)
   eval.py         # Evaluation with rollout GIF generation
   obs.py          # Data collection + visual encoding (random rollouts)
 ```
@@ -46,7 +45,7 @@ see-plan-act/
 
 | Encoder | Model | Dim | Status |
 |---------|-------|-----|--------|
-| ResNet  | ResNet18 (ImageNet init) | 512 | layer3+4 fine-tuned, layer1+2 frozen |
+| ResNet  | ResNet18 (ImageNet init) | 512 | Frozen + LoRA adapter (rank=32) |
 | CLIP image | ViT-B/32 | 512 | Frozen + LoRA adapter (rank=32) |
 | CLIP text | ViT-B/32 | 512 | Frozen + LoRA adapter (rank=32) |
 
@@ -68,21 +67,12 @@ see-plan-act/
 # Standard: train on all 10 tasks
 python train_bc.py \
   --demo_dir ../../libero/datasets/libero_object \
-  --skip_folds \
   --epochs 200
 
 # With a different seed
 python train_bc.py \
   --demo_dir ../../libero/datasets/libero_object \
-  --skip_folds \
   --seed 123 \
-  --epochs 200
-
-# With cross-task generalization (hold out 2 tasks for testing)
-python train_bc.py \
-  --demo_dir ../../libero/datasets/libero_object \
-  --held_out_tasks 0 1 \
-  --num_folds 4 \
   --epochs 200
 ```
 
@@ -121,18 +111,21 @@ Saves per-episode GIFs to `eval_gifs/` (e.g. `ep0_success.gif`, `ep1_fail.gif`).
 | Arg | Default | Description |
 |-----|---------|-------------|
 | `--demo_dir` | required | Path to demo HDF5 directory |
-| `--held_out_tasks` | [] (none) | File indices to hold out for testing |
-| `--num_folds` | 4 | Number of cross-validation folds |
-| `--skip_folds` | false | Skip CV, train final model only |
 | `--seed` | 42 | Random seed for reproducibility |
 | `--chunk_size` | 8 | Number of future actions to predict |
 | `--seq_len` | 10 | Temporal window length for LSTM |
 | `--hidden_dim` | 256 | Transformer/projection hidden dimension |
 | `--batch_size` | 64 | Batch size |
-| `--lr` | 1e-4 | Base learning rate (ResNet uses lr*0.1) |
+| `--lr` | 1e-4 | Base learning rate |
 | `--epochs` | 200 | Max training epochs |
 | `--patience` | 25 | Early stopping patience |
 | `--aux_weight` | 0.1 | Weight for auxiliary done prediction loss |
+| `--num_workers` | 8 | DataLoader worker processes for image preprocessing |
+| `--eval_every` | 3 | Run a rollout eval every N epochs (0 disables) |
+| `--eval_episodes` | 3 | Episodes per rollout eval |
+| `--eval_max_steps` | 150 | Max steps per rollout-eval episode |
+| `--eval_suite` | libero_object | LIBERO suite used for rollout eval |
+| `--eval_task_id` | 0 | Task index used for rollout eval |
 
 ## Dependencies
 

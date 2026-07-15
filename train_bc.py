@@ -10,6 +10,7 @@ import torchvision.models as models
 import torchvision.transforms as T
 from PIL import Image
 from pathlib import Path
+from robosuite.utils.transform_utils import quat2axisangle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -46,13 +47,14 @@ class BCPolicy(nn.Module):
         self.chunk_size = chunk_size
         self.clip_dim = clip_dim
 
-        # ResNet18 with last 2 layers unfrozen
+        # ResNet18, fully frozen; adapted via LoRA (same scheme as CLIP below)
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         resnet.fc = nn.Identity()
-        for name, param in resnet.named_parameters():
-            param.requires_grad = ('layer3' in name or 'layer4' in name)
+        for param in resnet.parameters():
+            param.requires_grad = False
         self.resnet = resnet
         resnet_dim = 512
+        self.resnet_adapter = LoRAAdapter(resnet_dim, rank=lora_rank)
 
         # LoRA adapter for frozen CLIP features
         self.clip_adapter = LoRAAdapter(clip_dim, rank=lora_rank)
@@ -90,21 +92,21 @@ class BCPolicy(nn.Module):
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.done_head = nn.Linear(hidden_dim, 1)
 
-        self._h = None
-        self._c = None
+    def train(self, mode=True):
+        super().train(mode)
+        self.resnet.eval()  # frozen backbone: keep BatchNorm stats fixed
+        return self
 
-    def reset_hidden(self):
-        self._h = None
-        self._c = None
-
-    def forward(self, clip_embed, images, proprio, lang, reset_hidden=True):
+    def forward(self, clip_embed, images, proprio, lang):
         # clip_embed: (B, T, 1024), images: (B, T, 2, 3, 224, 224)
         # proprio: (B, T, proprio_dim), lang: (B, 512)
         B, T = clip_embed.shape[0], clip_embed.shape[1]
 
-        # ResNet on raw images
+        # ResNet on raw images (frozen; only the LoRA adapter is trainable)
         img_flat = images.reshape(B * T * 2, *images.shape[-3:])
-        resnet_out = self.resnet(img_flat)
+        with torch.no_grad():
+            resnet_out = self.resnet(img_flat)
+        resnet_out = self.resnet_adapter(resnet_out)
         resnet_tokens = self.resnet_proj(resnet_out.reshape(B * T, 2, -1))
 
         # CLIP tokens (frozen + adapted)
@@ -123,12 +125,7 @@ class BCPolicy(nn.Module):
             vis_proj.reshape(B * T, -1), pro_proj, lang_proj,
         ], dim=-1).reshape(B, T, -1)
 
-        if reset_hidden or self._h is None:
-            lstm_out, (self._h, self._c) = self.lstm(lstm_in)
-        else:
-            lstm_out, (self._h, self._c) = self.lstm(lstm_in, (self._h, self._c))
-        self._h = self._h.detach()
-        self._c = self._c.detach()
+        lstm_out, _ = self.lstm(lstm_in)
 
         context = self.context_proj(lstm_out).reshape(B * T, 1, -1)
 
@@ -210,7 +207,7 @@ class DemoDataset(Dataset):
                     demo_lang.append(lang_embed.astype(np.float32))
                     demo_dones.append(np.array(don_list, dtype=np.float32))
 
-        all_actions_flat = np.concatenate([a.reshape(-1, act.shape[-1]) for a in demo_actions])
+        all_actions_flat = np.concatenate([a.reshape(-1, a.shape[-1]) for a in demo_actions])
         self.action_mean = all_actions_flat.mean(axis=0)
         self.action_std = all_actions_flat.std(axis=0) + 1e-8
         for i in range(len(demo_actions)):
@@ -226,9 +223,13 @@ class DemoDataset(Dataset):
 
         self.proprio = np.concatenate(demo_proprio)
 
+        # Windows include start_t < 0 (front-padded by repeating frame 0), matching
+        # rollout_episode's sliding window at the start of an episode -- otherwise the
+        # model never trains on the all-frames-identical input it sees at rollout step 0.
         self.windows = []
         for d_idx in range(len(demo_clip)):
-            for t in range(len(demo_clip[d_idx])):
+            T_demo = len(demo_clip[d_idx])
+            for t in range(-(self.seq_len - 1), T_demo):
                 self.windows.append((d_idx, t))
 
     def _encode_text(self, text):
@@ -253,35 +254,40 @@ class DemoDataset(Dataset):
     def __getitem__(self, idx):
         d_idx, start_t = self.windows[idx]
         T_demo = len(self.demo_clip[d_idx])
-        end_t = min(start_t + self.seq_len, T_demo)
-        actual = end_t - start_t
+        real_start = max(start_t, 0)
+        real_end = min(start_t + self.seq_len, T_demo)
+        front_pad = real_start - start_t
+        back_pad = (start_t + self.seq_len) - real_end
 
-        w_clip = self.demo_clip[d_idx][start_t:end_t]
-        w_ag = self.demo_agentview[d_idx][start_t:end_t]
-        w_eih = self.demo_eye_in_hand[d_idx][start_t:end_t]
-        w_pro = self.demo_proprio[d_idx][start_t:end_t]
-        w_act = self.demo_actions[d_idx][start_t:end_t]
-        w_don = self.demo_dones[d_idx][start_t:end_t]
+        w_clip = self.demo_clip[d_idx][real_start:real_end]
+        w_ag = self.demo_agentview[d_idx][real_start:real_end]
+        w_eih = self.demo_eye_in_hand[d_idx][real_start:real_end]
+        w_pro = self.demo_proprio[d_idx][real_start:real_end]
+        w_act = self.demo_actions[d_idx][real_start:real_end]
+        w_don = self.demo_dones[d_idx][real_start:real_end]
         lng = self.demo_lang[d_idx]
 
         # Preprocess images for ResNet (with augmentation)
         img_tensors = []
-        for t in range(actual):
+        for t in range(real_end - real_start):
             img_tensors.append(self._preprocess_image(w_ag[t]))
             img_tensors.append(self._preprocess_image(w_eih[t]))
 
-        # Pad if needed
-        if actual < self.seq_len:
-            pad = self.seq_len - actual
-            w_clip = np.pad(w_clip, ((0, pad), (0, 0)), mode='edge')
-            w_pro = np.pad(w_pro, ((0, pad), (0, 0)), mode='edge')
-            w_act = np.pad(w_act, ((0, pad), (0, 0), (0, 0)), mode='edge')
-            w_don = np.pad(w_don, (0, pad), mode='edge')
-            last_ag = img_tensors[-2]
-            last_eih = img_tensors[-1]
-            for _ in range(pad):
-                img_tensors.append(last_ag)
-                img_tensors.append(last_eih)
+        if front_pad > 0:
+            w_clip = np.pad(w_clip, ((front_pad, 0), (0, 0)), mode='edge')
+            w_pro = np.pad(w_pro, ((front_pad, 0), (0, 0)), mode='edge')
+            w_act = np.pad(w_act, ((front_pad, 0), (0, 0), (0, 0)), mode='edge')
+            w_don = np.pad(w_don, (front_pad, 0), mode='edge')
+            first_ag, first_eih = img_tensors[0], img_tensors[1]
+            img_tensors = [first_ag, first_eih] * front_pad + img_tensors
+
+        if back_pad > 0:
+            w_clip = np.pad(w_clip, ((0, back_pad), (0, 0)), mode='edge')
+            w_pro = np.pad(w_pro, ((0, back_pad), (0, 0)), mode='edge')
+            w_act = np.pad(w_act, ((0, back_pad), (0, 0), (0, 0)), mode='edge')
+            w_don = np.pad(w_don, (0, back_pad), mode='edge')
+            last_ag, last_eih = img_tensors[-2], img_tensors[-1]
+            img_tensors = img_tensors + [last_ag, last_eih] * back_pad
 
         images = torch.stack(img_tensors).reshape(self.seq_len, 2, 3, 224, 224)
 
@@ -310,6 +316,112 @@ class DemoSubset(Dataset):
         return self.dataset[self.indices[idx]]
 
 
+def encode_clip_image(clip_model, clip_preprocess, image, device):
+    x = clip_preprocess(Image.fromarray(image)).unsqueeze(0).to(device)
+    with torch.no_grad():
+        return clip_model.encode_image(x).squeeze(0).float()
+
+
+def build_lang_embed(clip_model, text, device):
+    tokens = clip.tokenize([text]).to(device)
+    with torch.no_grad():
+        return clip_model.encode_text(tokens).float()
+
+
+@torch.no_grad()
+def rollout_episode(policy, env, clip_model, clip_preprocess, lang_embed,
+                     action_mean, action_std, device, max_steps=300, seq_len=10,
+                     temporal_ensemble=True, ensemble_decay=0.1, collect_frames=False):
+    """Runs one closed-loop episode with a fixed seq_len sliding window (matches
+    how training windows are built -- LSTM always run from a zero hidden state)
+    plus optional ACT-style temporal ensembling over predicted action chunks.
+    Returns (success, frames or None).
+    """
+    obs = env.reset()
+    frames = [] if collect_frames else None
+    done = False
+    clip_hist, img_hist, proprio_hist = [], [], []
+    chunk_history = {}
+    for step in range(max_steps):
+        ag_clip = encode_clip_image(clip_model, clip_preprocess, obs["agentview_image"], device)
+        eih_clip = encode_clip_image(clip_model, clip_preprocess, obs["robot0_eye_in_hand_image"], device)
+        clip_embed = torch.cat([ag_clip, eih_clip])
+
+        ag_img = RESNET_PREPROCESS(Image.fromarray(obs["agentview_image"]))
+        eih_img = RESNET_PREPROCESS(Image.fromarray(obs["robot0_eye_in_hand_image"]))
+        images = torch.stack([ag_img, eih_img]).to(device)
+
+        gripper_open = np.array([1.0 if obs["robot0_gripper_qpos"][0] > 0.03 else 0.0])
+        proprio = np.concatenate([
+            obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]),
+            obs["robot0_gripper_qpos"], gripper_open,
+        ])
+        proprio = torch.tensor(proprio, dtype=torch.float32).to(device)
+
+        clip_hist.append(clip_embed)
+        img_hist.append(images)
+        proprio_hist.append(proprio)
+        clip_hist = clip_hist[-seq_len:]
+        img_hist = img_hist[-seq_len:]
+        proprio_hist = proprio_hist[-seq_len:]
+        pad = seq_len - len(clip_hist)
+
+        clip_seq = torch.stack([clip_hist[0]] * pad + clip_hist).unsqueeze(0)
+        img_seq = torch.stack([img_hist[0]] * pad + img_hist).unsqueeze(0)
+        proprio_seq = torch.stack([proprio_hist[0]] * pad + proprio_hist).unsqueeze(0)
+
+        action_chunk, _ = policy(clip_seq, img_seq, proprio_seq, lang_embed)
+        chunk_norm = action_chunk[0, -1]
+        chunk_denorm = (chunk_norm * action_std + action_mean).cpu().numpy()
+
+        if temporal_ensemble:
+            chunk_history[step] = chunk_denorm
+            oldest = max(0, step - policy.chunk_size + 1)
+            for s in list(chunk_history):
+                if s < oldest:
+                    del chunk_history[s]
+            candidates, weights = [], []
+            for s, chunk in chunk_history.items():
+                offset = step - s
+                if offset < len(chunk):
+                    candidates.append(chunk[offset])
+                    weights.append(np.exp(-ensemble_decay * offset))
+            weights = np.array(weights) / np.sum(weights)
+            action = np.sum(np.stack(candidates) * weights[:, None], axis=0)
+        else:
+            action = chunk_denorm[0]
+
+        obs, reward, done, info = env.step(action)
+        if collect_frames:
+            frames.append(Image.fromarray(obs["agentview_image"][::-1]))
+        if done:
+            return True, frames
+    return False, frames
+
+
+def quick_eval(policy, env, clip_model, clip_preprocess, lang_embed, action_mean, action_std,
+               device, num_episodes=3, max_steps=150, seq_len=10, gif_dir=None, epoch=None):
+    was_training = policy.training
+    policy.eval()
+    successes = 0
+    for ep in range(num_episodes):
+        success, frames = rollout_episode(
+            policy, env, clip_model, clip_preprocess, lang_embed,
+            action_mean, action_std, device, max_steps=max_steps, seq_len=seq_len,
+            collect_frames=gif_dir is not None,
+        )
+        successes += int(success)
+        if gif_dir is not None and frames:
+            epoch_dir = Path(gif_dir) / f"epoch_{epoch:04d}"
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+            result = "success" if success else "fail"
+            gif_path = epoch_dir / f"ep{ep}_{result}.gif"
+            frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    if was_training:
+        policy.train()
+    return successes / num_episodes
+
+
 def cosine_lr(epoch, warmup_epochs, total_epochs, base_lr, min_lr):
     if epoch < warmup_epochs:
         return base_lr * (epoch + 1) / warmup_epochs
@@ -317,9 +429,11 @@ def cosine_lr(epoch, warmup_epochs, total_epochs, base_lr, min_lr):
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def train_one(train_dataset, val_dataset, args, save_path):
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, pin_memory=True)
+def train_one(train_dataset, val_dataset, args, save_path, eval_ctx=None):
+    loader_kwargs = dict(num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
+                          pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, **loader_kwargs)
 
     proprio_dim = train_dataset.proprio.shape[1]
     policy = BCPolicy(
@@ -328,15 +442,18 @@ def train_one(train_dataset, val_dataset, args, save_path):
         hidden_dim=args.hidden_dim,
     ).to(device)
 
-    resnet_params = [p for n, p in policy.named_parameters() if 'resnet' in n and p.requires_grad]
-    other_params = [p for n, p in policy.named_parameters() if 'resnet' not in n]
-    optimizer = torch.optim.AdamW([
-        {'params': other_params, 'lr': args.lr},
-        {'params': resnet_params, 'lr': args.lr * 0.1},
-    ], weight_decay=1e-4)
+    # ResNet backbone is fully frozen (LoRA-adapted like CLIP), so every
+    # trainable param shares one LR group -- no more backbone/head split.
+    optimizer = torch.optim.AdamW(
+        [p for p in policy.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=1e-4,
+    )
 
     action_loss_fn = nn.L1Loss()
     done_loss_fn = nn.BCEWithLogitsLoss()
+
+    action_mean_t = torch.tensor(train_dataset.action_mean, dtype=torch.float32).to(device)
+    action_std_t = torch.tensor(train_dataset.action_std, dtype=torch.float32).to(device)
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -344,9 +461,7 @@ def train_one(train_dataset, val_dataset, args, save_path):
     for epoch in range(args.epochs):
         lr = cosine_lr(epoch, 5, args.epochs, args.lr, 1e-5)
         for pg in optimizer.param_groups:
-            pg['lr'] = lr if 'resnet' not in str(pg.get('params', '')) else lr * 0.1
-        optimizer.param_groups[0]['lr'] = lr
-        optimizer.param_groups[1]['lr'] = lr * 0.1
+            pg['lr'] = lr
 
         policy.train()
         train_loss = 0
@@ -355,8 +470,7 @@ def train_one(train_dataset, val_dataset, args, save_path):
                 clip_embed.to(device), images.to(device), proprio.to(device),
                 lang.to(device), actions.to(device), dones.to(device),
             )
-            policy.reset_hidden()
-            pred_actions, done_logits = policy(clip_embed, images, proprio, lang, reset_hidden=True)
+            pred_actions, done_logits = policy(clip_embed, images, proprio, lang)
             loss_action = action_loss_fn(pred_actions, actions)
             loss_done = done_loss_fn(done_logits.squeeze(-1), dones)
             loss = loss_action + args.aux_weight * loss_done
@@ -374,14 +488,22 @@ def train_one(train_dataset, val_dataset, args, save_path):
                     clip_embed.to(device), images.to(device), proprio.to(device),
                     lang.to(device), actions.to(device), dones.to(device),
                 )
-                policy.reset_hidden()
-                pred_actions, done_logits = policy(clip_embed, images, proprio, lang, reset_hidden=True)
+                pred_actions, done_logits = policy(clip_embed, images, proprio, lang)
                 loss_action = action_loss_fn(pred_actions, actions)
                 loss_done = done_loss_fn(done_logits.squeeze(-1), dones)
                 val_loss += (loss_action + args.aux_weight * loss_done).item() * len(actions)
         val_loss /= len(val_dataset)
 
         print(f"  Epoch {epoch+1}/{args.epochs}  lr={lr:.2e}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}")
+
+        if eval_ctx is not None and args.eval_every > 0 and (epoch + 1) % args.eval_every == 0:
+            success_rate = quick_eval(
+                policy, eval_ctx["env"], eval_ctx["clip_model"], eval_ctx["clip_preprocess"],
+                eval_ctx["lang_embed"], action_mean_t, action_std_t, device,
+                num_episodes=args.eval_episodes, max_steps=args.eval_max_steps, seq_len=args.seq_len,
+                gif_dir=args.eval_gif_dir or None, epoch=epoch + 1,
+            )
+            print(f"  [rollout eval] epoch {epoch+1}: success {success_rate:.1%} ({args.eval_episodes} episodes, task {args.eval_task_id})")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -411,57 +533,33 @@ def train(args):
 
     clip_model, clip_preprocess = clip.load("ViT-B/32", device=device)
 
-    demo_dir = Path(args.demo_dir)
-    all_demo_files = sorted(demo_dir.glob("*_demo.hdf5"))
-    held_out = set(args.held_out_tasks)
-    train_files = [f for i, f in enumerate(all_demo_files) if i not in held_out]
-    test_files = [f for i, f in enumerate(all_demo_files) if i in held_out]
+    eval_ctx = None
+    if args.eval_every > 0:
+        from libero.libero import benchmark as libero_benchmark
+        from libero.libero.envs import OffScreenRenderEnv
 
-    print(f"Total tasks: {len(all_demo_files)}, train: {len(train_files)}, test: {len(test_files)}")
-    for f in test_files:
-        print(f"  [test] {f.stem}")
+        eval_task_suite = libero_benchmark.get_benchmark_dict()[args.eval_suite]()
+        eval_task = eval_task_suite.get_task(args.eval_task_id)
+        eval_env = OffScreenRenderEnv(
+            bddl_file_name=eval_task_suite.get_task_bddl_file_path(args.eval_task_id),
+            camera_heights=128, camera_widths=128,
+        )
+        eval_ctx = {
+            "env": eval_env,
+            "clip_model": clip_model,
+            "clip_preprocess": clip_preprocess,
+            "lang_embed": build_lang_embed(clip_model, eval_task.language, device),
+        }
+        print(f"Rollout eval every {args.eval_every} epochs on task {args.eval_task_id}: {eval_task.language!r}")
+
+    demo_dir = Path(args.demo_dir)
+    train_files = sorted(demo_dir.glob("*_demo.hdf5"))
+    print(f"Total tasks: {len(train_files)}")
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     ds_kwargs = dict(chunk_size=args.chunk_size, seq_len=args.seq_len)
-
-    # --- K-fold cross-validation ---
-    if not args.skip_folds:
-        num_folds = args.num_folds
-        np.random.seed(42)
-        indices = np.random.permutation(len(train_files))
-        folds = np.array_split(indices, num_folds)
-
-        fold_results = []
-        for fold_i in range(num_folds):
-            val_indices = set(folds[fold_i].tolist())
-            fold_train_files = [train_files[j] for j in range(len(train_files)) if j not in val_indices]
-            fold_val_files = [train_files[j] for j in folds[fold_i]]
-
-            print(f"\n{'='*60}")
-            print(f"Fold {fold_i+1}/{num_folds}")
-            for f in fold_val_files:
-                print(f"    [val] {f.stem}")
-
-            print("  Loading train set (with augmentation)...")
-            fold_train_ds = DemoDataset(fold_train_files, clip_model, clip_preprocess, **ds_kwargs, augment=True)
-            print(f"  {len(fold_train_ds)} train transitions")
-
-            print("  Loading val set...")
-            fold_val_ds = DemoDataset(fold_val_files, clip_model, clip_preprocess, **ds_kwargs, augment=False)
-            print(f"  {len(fold_val_ds)} val transitions")
-
-            fold_path = save_dir / f"bc_fold{fold_i}.pt"
-            best_val = train_one(fold_train_ds, fold_val_ds, args, fold_path)
-            fold_results.append(best_val)
-            print(f"  Fold {fold_i+1} best val loss: {best_val:.6f}")
-
-        print(f"\n{'='*60}")
-        print(f"Cross-validation results:")
-        for i, v in enumerate(fold_results):
-            print(f"  Fold {i+1}: {v:.6f}")
-        print(f"  Mean: {np.mean(fold_results):.6f}  Std: {np.std(fold_results):.6f}")
 
     # --- Final model ---
     print(f"\n{'='*60}")
@@ -476,17 +574,17 @@ def train(args):
     val_split = DemoSubset(final_ds, val_indices.indices)
 
     final_path = save_dir / f"bc_best_seed{args.seed}.pt"
-    best_final = train_one(train_split, val_split, args, final_path)
+    best_final = train_one(train_split, val_split, args, final_path, eval_ctx=eval_ctx)
     print(f"Final model best val loss: {best_final:.6f}")
     print(f"Saved final checkpoint to {final_path}")
+
+    if eval_ctx is not None:
+        eval_ctx["env"].close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo_dir", type=str, required=True)
-    parser.add_argument("--held_out_tasks", type=int, nargs="*", default=[])
-    parser.add_argument("--num_folds", type=int, default=4)
-    parser.add_argument("--skip_folds", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chunk_size", type=int, default=8)
     parser.add_argument("--seq_len", type=int, default=10)
@@ -497,5 +595,13 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--aux_weight", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument("--num_workers", type=int, default=8, help="DataLoader worker processes for image preprocessing")
+    parser.add_argument("--eval_every", type=int, default=3, help="rollout-eval every N epochs, 0 disables")
+    parser.add_argument("--eval_episodes", type=int, default=3)
+    parser.add_argument("--eval_max_steps", type=int, default=150)
+    parser.add_argument("--eval_suite", type=str, default="libero_object")
+    parser.add_argument("--eval_task_id", type=int, default=0)
+    parser.add_argument("--eval_gif_dir", type=str, default="eval_gifs",
+                         help="dir to save rollout-eval GIFs during training, pass '' to disable")
     args = parser.parse_args()
     train(args)
