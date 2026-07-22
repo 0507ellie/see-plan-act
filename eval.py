@@ -10,6 +10,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 POLICY_REGISTRY = {
     "bc": ("train_bc", "BCPolicy"),
+    "residual_ppo": ("train_ppo", "FiLMResidualPolicy"),
 }
 
 
@@ -19,11 +20,35 @@ def load_policy(policy_type, checkpoint_path):
     policy_class = getattr(module, class_name)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    policy = policy_class(
-        proprio_dim=ckpt["proprio_dim"],
-        chunk_size=ckpt.get("chunk_size", 8),
-        hidden_dim=ckpt.get("hidden_dim", 256),
-    ).to(device)
+    kwargs = {
+        "proprio_dim": ckpt["proprio_dim"],
+        "chunk_size": ckpt.get("chunk_size", 8),
+        "hidden_dim": ckpt.get("hidden_dim", 256),
+    }
+    # BCPolicy-only architecture kwargs, pulled from the checkpoint so a distilled
+    # checkpoint that changed lora_rank (or any other of these) doesn't silently get
+    # reconstructed with class defaults and then fail to load_state_dict (size mismatch).
+    if policy_class.__name__ == "BCPolicy":
+        kwargs["clip_dim"] = ckpt.get("clip_dim", 512)
+        kwargs["lang_dim"] = ckpt.get("lang_dim", 512)
+        kwargs["action_dim"] = ckpt.get("action_dim", 7)
+        kwargs["num_layers"] = ckpt.get("num_layers", 4)
+        kwargs["num_heads"] = ckpt.get("num_heads", 4)
+        kwargs["dropout"] = ckpt.get("dropout", 0.1)
+        kwargs["rnn_hidden"] = ckpt.get("rnn_hidden", 512)
+        kwargs["rnn_layers"] = ckpt.get("rnn_layers", 2)
+        kwargs["lora_rank"] = ckpt.get("lora_rank", 32)
+    # log_std_min/log_std_max only apply to FiLMResidualPolicy (BCPolicy has no such kwargs) and
+    # only exist in checkpoints saved after train_ppo.py started persisting them, passed
+    # conditionally so this stays a no-op for "bc" checkpoints and for older "residual_ppo"
+    # checkpoints predating the fix, which fall back to FiLMResidualPolicy's class defaults.
+    # Without this, a reloaded residual policy would silently get the class's default
+    # exploration-noise ceiling instead of whatever the checkpoint was actually trained with.
+    if "log_std_min" in ckpt:
+        kwargs["log_std_min"] = ckpt["log_std_min"]
+    if "log_std_max" in ckpt:
+        kwargs["log_std_max"] = ckpt["log_std_max"]
+    policy = policy_class(**kwargs).to(device)
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.eval()
     return policy, ckpt, module
@@ -47,6 +72,7 @@ def evaluate(args):
         "bddl_file_name": task_suite.get_task_bddl_file_path(task_id),
         "camera_heights": 128,
         "camera_widths": 128,
+        "hard_reset": False,
     })
 
     gif_dir = Path(args.gif_dir)

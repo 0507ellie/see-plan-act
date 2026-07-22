@@ -97,7 +97,7 @@ class BCPolicy(nn.Module):
         self.resnet.eval()  # frozen backbone: keep BatchNorm stats fixed
         return self
 
-    def forward(self, clip_embed, images, proprio, lang):
+    def forward(self, clip_embed, images, proprio, lang, return_features=False):
         # clip_embed: (B, T, 1024), images: (B, T, 2, 3, 224, 224)
         # proprio: (B, T, proprio_dim), lang: (B, 512)
         B, T = clip_embed.shape[0], clip_embed.shape[1]
@@ -106,8 +106,25 @@ class BCPolicy(nn.Module):
         img_flat = images.reshape(B * T * 2, *images.shape[-3:])
         with torch.no_grad():
             resnet_out = self.resnet(img_flat)
-        resnet_out = self.resnet_adapter(resnet_out)
-        resnet_tokens = self.resnet_proj(resnet_out.reshape(B * T, 2, -1))
+        resnet_out = resnet_out.reshape(B, T, 2, -1)
+
+        return self._forward_from_features(resnet_out, clip_embed, proprio, lang, return_features)
+
+    def forward_from_cached_features(self, resnet_out, clip_embed, proprio, lang, return_features=False):
+        """Alternate entry point for when resnet_out/clip_embed (the frozen backbones'
+        pre-adapter outputs) are already available, e.g. cached by harvest_rollouts.py
+        and reused across distillation epochs, so the frozen backbones never need to
+        be re-run. Produces identical output to forward() for the same observation.
+        resnet_out: (B, T, 2, resnet_dim), clip_embed: (B, T, 1024)."""
+        return self._forward_from_features(resnet_out, clip_embed, proprio, lang, return_features)
+
+    def _forward_from_features(self, resnet_out, clip_embed, proprio, lang, return_features):
+        # resnet_out: (B, T, 2, resnet_dim), already computed. Shared by forward() and
+        # forward_from_cached_features() so both stay consistent.
+        B, T = clip_embed.shape[0], clip_embed.shape[1]
+
+        resnet_out = self.resnet_adapter(resnet_out.reshape(B * T, 2, -1))
+        resnet_tokens = self.resnet_proj(resnet_out)
 
         # CLIP tokens (frozen + adapted)
         clip_tokens = clip_embed.reshape(B * T, 2, self.clip_dim)
@@ -139,6 +156,12 @@ class BCPolicy(nn.Module):
 
         actions = self.action_head(decoded).reshape(B, T, self.chunk_size, -1)
         done_logits = self.done_head(decoded[:, -1, :]).reshape(B, T, 1)
+        if return_features:
+            # decoded: (B*T, chunk_size, hidden_dim), pre-action-head tokens,
+            # exposed so a downstream module (e.g. a residual policy head) can
+            # condition on the same fused multimodal representation without
+            # redoing the CLIP/ResNet/LSTM/decoder work.
+            return actions, done_logits, decoded
         return actions, done_logits
 
 
@@ -224,7 +247,7 @@ class DemoDataset(Dataset):
         self.proprio = np.concatenate(demo_proprio)
 
         # Windows include start_t < 0 (front-padded by repeating frame 0), matching
-        # rollout_episode's sliding window at the start of an episode -- otherwise the
+        # rollout_episode's sliding window at the start of an episode, otherwise the
         # model never trains on the all-frames-identical input it sees at rollout step 0.
         self.windows = []
         for d_idx in range(len(demo_clip)):
@@ -331,13 +354,29 @@ def build_lang_embed(clip_model, text, device):
 @torch.no_grad()
 def rollout_episode(policy, env, clip_model, clip_preprocess, lang_embed,
                      action_mean, action_std, device, max_steps=300, seq_len=10,
-                     temporal_ensemble=True, ensemble_decay=0.1, collect_frames=False):
-    """Runs one closed-loop episode with a fixed seq_len sliding window (matches
-    how training windows are built -- LSTM always run from a zero hidden state)
-    plus optional ACT-style temporal ensembling over predicted action chunks.
-    Returns (success, frames or None).
-    """
-    obs = env.reset()
+                     temporal_ensemble=True, ensemble_decay=0.1, collect_frames=False,
+                     init_state=None):
+    """Runs one closed-loop episode with a fixed seq_len sliding window plus optional
+    ACT-style temporal ensembling over predicted action chunks. Returns (success,
+    frames or None).
+
+    If init_state is given (a flattened sim state), the episode starts from that exact
+    state via env.set_init_state instead of a randomized env.reset(), so different
+    checkpoints/runs can be compared on identical initial conditions, matching LIBERO's
+    own eval protocol.
+
+    Always calls reset() first even when init_state is given: set_init_state() only
+    teleports sim state, it doesn't reset robosuite's internal timestep/horizon
+    bookkeeping, so reusing one env across many fixed-state trials without a reset in
+    between would eventually exceed the env's horizon and robosuite would refuse
+    further steps."""
+    if init_state is not None:
+        env.reset()
+        obs = env.set_init_state(init_state)
+        for _ in range(5):
+            obs, _, _, _ = env.step(np.zeros(7))
+    else:
+        obs = env.reset()
     frames = [] if collect_frames else None
     done = False
     clip_hist, img_hist, proprio_hist = [], [], []
@@ -443,7 +482,7 @@ def train_one(train_dataset, val_dataset, args, save_path, eval_ctx=None):
     ).to(device)
 
     # ResNet backbone is fully frozen (LoRA-adapted like CLIP), so every
-    # trainable param shares one LR group -- no more backbone/head split.
+    # trainable param shares one LR group, no more backbone/head split.
     optimizer = torch.optim.AdamW(
         [p for p in policy.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=1e-4,
@@ -515,6 +554,19 @@ def train_one(train_dataset, val_dataset, args, save_path, eval_ctx=None):
                 "proprio_dim": proprio_dim,
                 "chunk_size": args.chunk_size,
                 "hidden_dim": args.hidden_dim,
+                # Not currently CLI-configurable, train_one() always constructs BCPolicy with
+                # these left at class defaults, but saving them explicitly means a downstream
+                # loader (eval.py, train_ppo.py, train_sac.py) never has to silently assume that
+                # stays true. If any of these ever become CLI args, update this dict to match.
+                "clip_dim": policy.clip_dim,
+                "lang_dim": policy.lang_proj.in_features,
+                "action_dim": policy.action_head.out_features,
+                "num_layers": 4,
+                "num_heads": 4,
+                "dropout": 0.1,
+                "rnn_hidden": policy.lstm.hidden_size,
+                "rnn_layers": policy.lstm.num_layers,
+                "lora_rank": policy.resnet_adapter.down.out_features,
             }, save_path)
         else:
             patience_counter += 1
@@ -543,6 +595,7 @@ def train(args):
         eval_env = OffScreenRenderEnv(
             bddl_file_name=eval_task_suite.get_task_bddl_file_path(args.eval_task_id),
             camera_heights=128, camera_widths=128,
+            hard_reset=False,
         )
         eval_ctx = {
             "env": eval_env,
