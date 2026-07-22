@@ -31,6 +31,7 @@ for task_id in range(task_suite.n_tasks):
     env = OffScreenRenderEnv(
         bddl_file_name=task_suite.get_task_bddl_file_path(task_id),
         camera_heights=128, camera_widths=128,
+        hard_reset=False,
     )
     slug = re.sub(r"\W+", "_", task.language).strip("_")
     task_dir = GIF_DIR / f"task{task_id}_{slug}"

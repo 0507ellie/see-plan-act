@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Only keep the best checkpoint from each training run; periodic/intermediate
+# checkpoints stay local and out of git.
+checkpoints_ppo/*/*_update*.pt
+checkpoints_sac/*/*_update*.pt
+
+# Raw harvested rollout data, regenerable from the SAC checkpoints; several
+# shards exceed GitHub's 100MB per-file limit.
+rollout_shards/

@@ -41,6 +41,7 @@ env = OffScreenRenderEnv(**{
     "camera_heights": 256,
     "camera_widths": 256,
     "camera_depths": True,
+    "hard_reset": False,
 })
 
 obs = env.reset()
